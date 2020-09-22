@@ -10,6 +10,8 @@ import scala.util.control.NonFatal
 
 import java.util.concurrent.{ConcurrentLinkedQueue, Executors}
 import java.util.function.Consumer
+import java.nio.file.Path
+import java.net.URL
 
 private sealed class SeleniumRun(
     driver: WebDriver with JavascriptExecutor,
@@ -129,20 +131,19 @@ private[selenium] object SeleniumRun {
       newRun: Ctor[T], failed: Throwable => T): T = {
     validator.validate(runConfig)
 
-    val scripts = input.map {
-      case Input.Script(s) => s
-      case _               => throw new UnsupportedInputException(input)
+    var scripts: Seq[Path] = Seq.empty
+    var modules: Seq[Path] = Seq.empty
+
+    input.foreach {
+      case Input.Script(s) => scripts :+= s
+      case Input.ESModule(s) => modules :+= s
+      case _ => throw new UnsupportedInputException(input)
     }
 
     try {
       withCleanup(FileMaterializer(config.materialization))(_.close()) { m =>
-        val allScriptURLs = (
-            m.materialize("setup.js", JSSetup.setupCode(enableCom)) +:
-            scripts.map(m.materialize)
-        )
-
-        val page = m.materialize("scalajsRun.html", htmlPage(allScriptURLs))
-
+        val setupJsUrl = m.materialize("setup.js", JSSetup.setupCode(enableCom))
+        val page = m.materialize("scalajsRun.html", htmlPage(setupJsUrl, input, m))
         withCleanup(newDriver())(maybeCleanupDriver(_, config)) { driver =>
           driver.navigate().to(page)
 
@@ -171,13 +172,25 @@ private[selenium] object SeleniumRun {
   private def maybeCleanupDriver(d: WebDriver, config: SeleniumJSEnv.Config) =
     if (!config.keepAlive) d.close()
 
-  private def htmlPage(scripts: Seq[java.net.URL]): String = {
-    val scriptTags =
-      scripts.map(path => s"<script src='${path.toString}'></script>")
+  private def htmlPage(setupJsUrl: URL, input: Seq[Input], materializer: FileMaterializer): String = {
+    val setupJs = s"<script src='${setupJsUrl.toString}'></script>"
+
+    val tags = input.map {
+      case Input.Script(path) =>
+        val url = materializer.materialize(path)
+        s"<script src='${url.toString}'></script>"
+      case Input.ESModule(path) =>
+        val url = materializer.materialize(path)
+        s"<script type='module' src='${url.toString}'></script>"
+      case _ => throw new UnsupportedInputException(input)
+    }
+
+    val allTags = setupJs +: tags
+
     s"""<html>
        |  <meta charset="UTF-8">
        |  <body>
-       |    ${scriptTags.mkString("\n    ")}
+       |    ${allTags.mkString("\n    ")}
        |  </body>
        |</html>
     """.stripMargin
